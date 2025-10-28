@@ -1,58 +1,137 @@
-name: VPS Setup - Direct SSH
+name: VPS Setup - Enhanced
 on:
   workflow_dispatch:
-
-env:
-  SSH_PASSWORD: "root@123"
+  schedule:
+    - cron: '0 */6 * * *'  # تشغيل تلقائي كل 6 ساعات
 
 jobs:
   secure-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 400
     
     steps:
-    - name: Install & Secure SSH
+    - name: Install & Configure SSH
       run: |
         sudo apt update -y
-        sudo apt install -y openssh-server ufail2ban
+        sudo apt install -y openssh-server net-tools
+        sudo systemctl enable ssh
+        sudo systemctl start ssh
         
         # تأمين SSH
-        echo "root:$SSH_PASSWORD" | sudo chpasswd
-        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-        echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
-        echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
+        echo "root:${SSH_PASSWORD}" | sudo chpasswd
+        echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+        echo "ClientAliveInterval 60" | sudo tee -a /etc/ssh/sshd_config
+        echo "ClientAliveCountMax 3" | sudo tee -a /etc/ssh/sshd_config
+        sudo service ssh restart
         
-        # فتح port SSH
-        sudo ufw allow 22/tcp
-        sudo ufw --force enable
-        
-        sudo systemctl restart ssh
-        echo "SSH secured and running"
+        echo "SSH configured successfully"
 
-    - name: Display Connection Info
+    - name: Install Tailscale with Retry
       run: |
-        PUBLIC_IP=$(curl -s ifconfig.me)
-        echo "=========================================="
-        echo "VPS READY FOR SSH CONNECTION"
-        echo "Public IP: $PUBLIC_IP"
-        echo "Port: 22"
-        echo "Username: root"
-        echo "Password: $SSH_PASSWORD"
-        echo "=========================================="
-        echo "Connect using:"
-        echo "ssh root@$PUBLIC_IP"
-        echo "=========================================="
-
-    - name: Keep VPS Alive
-      run: |
-        # نسخة محسنة مع معالجة الإشارات
-        cleanup() {
-            echo "[$(date)] Cleaning up before exit..."
-            exit 0
-        }
-        trap cleanup SIGTERM SIGINT
+        max_retries=3
+        count=0
         
-        while true; do
-            echo "[$(date)] VPS running - IP: $(curl -s ifconfig.me)"
-            sleep 300
+        while [ $count -lt $max_retries ]
+        do
+          curl -fsSL https://tailscale.com/install.sh | sh && break
+          count=$((count+1))
+          echo "Tailscale installation failed, retrying... ($count/$max_retries)"
+          sleep 10
         done
+        
+        if [ $count -eq $max_retries ]; then
+          echo "Failed to install Tailscale after $max_retries attempts"
+          exit 1
+        fi
+        
+        # تشغيل Tailscale مع إعادة المحاولة
+        sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-github-actions --accept-routes=true --accept-dns=false
+        
+        # الحصول على IP والتحقق منه
+        sleep 10
+        tailscale_ip=$(tailscale ip -4 | head -n 1)
+        
+        if [ -z "$tailscale_ip" ]; then
+          echo "Failed to get Tailscale IP, retrying..."
+          sudo tailscale down
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+          sleep 10
+          tailscale_ip=$(tailscale ip -4 | head -n 1)
+        fi
+        
+        echo "TAILSCALE_IP=$tailscale_ip" >> $GITHUB_ENV
+        echo "Tailscale connected successfully: $tailscale_ip"
+
+    - name: Health Check & Monitoring
+      run: |
+        # إنشاء سكريبت مراقبة
+        cat > /tmp/health_monitor.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+          # التحقق من حالة SSH
+          if ! pgrep -x "sshd" > /dev/null; then
+            echo "[$(date)] SSH is down, restarting..."
+            sudo service ssh restart
+          fi
+          
+          # التحقق من اتصال Tailscale
+          if ! tailscale status | grep -q "connected"; then
+            echo "[$(date)] Tailscale disconnected, reconnecting..."
+            sudo tailscale up --authkey=$TAILSCALE_KEY
+          fi
+          
+          # التحقق من استخدام الذاكرة
+          memory_usage=$(free | awk 'NR==2{printf "%.2f%%", $3*100/$2}')
+          echo "[$(date)] System Health - Memory: $memory_usage"
+          
+          sleep 60
+        done
+        EOF
+        
+        chmod +x /tmp/health_monitor.sh
+        nohup /tmp/health_monitor.sh > /tmp/health_monitor.log 2>&1 &
+
+    - name: Install Fail2ban for Security
+      run: |
+        sudo apt install -y fail2ban
+        sudo systemctl enable fail2ban
+        sudo systemctl start fail2ban
+
+    - name: Verify Services
+      run: |
+        echo "=== Service Status ==="
+        sudo systemctl status ssh --no-pager
+        echo ""
+        echo "=== Tailscale Status ==="
+        tailscale status
+        echo ""
+        echo "=== Network Info ==="
+        tailscale ip -4
+        echo ""
+        echo "VPS is ready with enhanced stability features"
+        echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+
+    - name: Keep Alive with Health Checks
+      run: |
+        # سكريبت للحفاظ على التشغيل مع مراقبة مستمرة
+        counter=0
+        while [ $counter -lt 288 ]; do  # 24 ساعة بفحص كل 5 دقائق
+          current_time=$(date '+%Y-%m-%d %H:%M:%S')
+          
+          # تسجيل الحالة
+          echo "[$current_time] VPS running - Cycle: $counter/288"
+          
+          # فحص صحة الخدمات كل 10 دورات
+          if [ $((counter % 10)) -eq 0 ]; then
+            # إعادة تشغيل الخدمات إذا توقفت
+            sudo systemctl is-active --quiet ssh || sudo service ssh start
+            tailscale status | grep -q "stopped" && sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+          fi
+          
+          counter=$((counter + 1))
+          sleep 300  # 5 دقائق
+        done
+
+env:
+  SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+  TAILSCALE_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
