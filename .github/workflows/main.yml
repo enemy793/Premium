@@ -1,40 +1,58 @@
-name: VPS
+name: VPS Setup - Direct SSH
 on:
   workflow_dispatch:
+
+env:
+  SSH_PASSWORD: "root@123"
+
 jobs:
   secure-vps:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    
     steps:
-      - name: Install & Configure SSH
-        run: |
-          sudo apt update -y
-          sudo apt install -y openssh-server
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          echo "root:admin@123" | sudo chpasswd
-          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
-          sudo service ssh restart
-          echo "✅ SSH user: root | pass: admin@123"
+    - name: Install & Secure SSH
+      run: |
+        sudo apt update -y
+        sudo apt install -y openssh-server ufail2ban
+        
+        # تأمين SSH
+        echo "root:$SSH_PASSWORD" | sudo chpasswd
+        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+        echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+        echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
+        
+        # فتح port SSH
+        sudo ufw allow 22/tcp
+        sudo ufw --force enable
+        
+        sudo systemctl restart ssh
+        echo "SSH secured and running"
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-${{ github.run_id }}
-          tsIP=$(tailscale ip -4 | head -n 1)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "✅ Tailscale IP: $tsIP"
+    - name: Display Connection Info
+      run: |
+        PUBLIC_IP=$(curl -s ifconfig.me)
+        echo "=========================================="
+        echo "VPS READY FOR SSH CONNECTION"
+        echo "Public IP: $PUBLIC_IP"
+        echo "Port: 22"
+        echo "Username: root"
+        echo "Password: $SSH_PASSWORD"
+        echo "=========================================="
+        echo "Connect using:"
+        echo "ssh root@$PUBLIC_IP"
+        echo "=========================================="
 
-      - name: Verify SSH Access
-        run: |
-          echo "Tailscale VPS ready!"
-          echo "IP: $env:TAILSCALE_IP"
-          echo "User: root"
-          echo "Pass: admin@123"
-
-      - name: Keep VPS Alive
-        run: |
-          while true; do
-            echo "[$(date)] VPS running..."
+    - name: Keep VPS Alive
+      run: |
+        # نسخة محسنة مع معالجة الإشارات
+        cleanup() {
+            echo "[$(date)] Cleaning up before exit..."
+            exit 0
+        }
+        trap cleanup SIGTERM SIGINT
+        
+        while true; do
+            echo "[$(date)] VPS running - IP: $(curl -s ifconfig.me)"
             sleep 300
-          done
+        done
